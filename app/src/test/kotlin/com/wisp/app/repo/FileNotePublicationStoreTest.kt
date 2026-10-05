@@ -117,4 +117,28 @@ class FileNotePublicationStoreTest {
         assertTrue(second.load().isEmpty())
         assertEquals("2".repeat(64), second.loadReceipts().single().eventId)
     }
+
+    @Test fun `full recovery storage preserves old posts rejects new posts and allows retry`() {
+        val store = FileNotePublicationStore(folder.newFolder("full"), JvmFileIO())
+        val events = (1..RECOVERY_POST_LIMIT).map { note.copy(id = it.toString(16).padStart(64, '0')) }
+        events.forEach { store.save(pending(it)) }
+        val next = note.copy(id = "f".repeat(64))
+        try { store.save(pending(next)); fail("Expected full recovery storage") } catch (_: IOException) { }
+        assertEquals(events.toSet(), store.load().map { it.event }.toSet())
+        store.save(pending(events.first()).copy(attempt = 2))
+        store.save(accepted(events.first()))
+        store.save(pending(next))
+        assertEquals(RECOVERY_POST_LIMIT, store.load().size)
+        assertTrue(store.load().any { it.event == next })
+    }
+
+    @Test fun `invalid JSON and mismatched filenames are removed`() {
+        val directory = folder.newFolder("invalid")
+        val store = FileNotePublicationStore(directory, JvmFileIO())
+        store.save(pending())
+        File(directory, "${note.id}.json").renameTo(File(directory, "${"2".repeat(64)}.json"))
+        File(directory, "${"3".repeat(64)}.json").writeText("invalid JSON")
+        assertTrue(store.load().isEmpty())
+        assertTrue(directory.listFiles()!!.isEmpty())
+    }
 }

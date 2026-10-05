@@ -16,6 +16,7 @@ import kotlinx.coroutines.withContext
 sealed class PowStatus {
     data object Idle : PowStatus()
     data class Mining(val kind: Int, val attempts: Long, val difficulty: Int) : PowStatus()
+    data object Publishing : PowStatus()
     data class Done(val message: String) : PowStatus()
     data class Failed(val message: String) : PowStatus()
 }
@@ -31,8 +32,9 @@ class PowManager(
     private var miningJob: Job? = null
     private var generation = 0L
 
-    val isBusy: Boolean get() = _status.value is PowStatus.Mining
+    val isBusy: Boolean get() = _status.value is PowStatus.Mining || _status.value is PowStatus.Publishing
 
+    @Synchronized
     fun submitNote(
         signer: NostrSigner,
         content: String,
@@ -51,7 +53,7 @@ class PowManager(
 
         miningJob = notePublisher.launchWork {
             try {
-                _status.value = PowStatus.Mining(kind, 0, difficulty)
+                updateStatus(token, PowStatus.Mining(kind, 0, difficulty))
 
                 val result = withContext(miningDispatcher) {
                     Nip13.mine(
@@ -63,7 +65,7 @@ class PowManager(
                         createdAt = createdAt,
                         onProgress = { attempts ->
                             notePublisher.launchWork {
-                                if (token == generation) _status.value = PowStatus.Mining(kind, attempts, difficulty)
+                                updateProgress(token, PowStatus.Mining(kind, attempts, difficulty))
                             }
                         }
                     )
@@ -76,30 +78,42 @@ class PowManager(
                     createdAt = result.createdAt
                 )
 
+                updateStatus(token, PowStatus.Publishing)
                 val publication = notePublisher.publish(event, inboxPubkeys)
                 currentCoroutineContext().ensureActive()
                 onPublished?.invoke()
 
                 val accepted = publication.acceptedCount
-                _status.value = if (accepted > 0) {
+                updateStatus(token, if (accepted > 0) {
                     PowStatus.Done("Confirmed by $accepted relay${if (accepted != 1) "s" else ""}")
                 } else {
                     PowStatus.Failed("No relay confirmed publication. Note saved; use Rebroadcast to retry.")
-                }
+                })
                 delay(3000)
-                _status.value = PowStatus.Idle
+                updateStatus(token, PowStatus.Idle)
             } catch (e: kotlinx.coroutines.CancellationException) {
-                if (token == generation) _status.value = PowStatus.Idle
+                updateStatus(token, PowStatus.Idle)
                 throw e
             } catch (e: Exception) {
-                _status.value = PowStatus.Failed(e.message ?: "Mining failed")
+                updateStatus(token, PowStatus.Failed(e.message ?: "Mining failed"))
                 delay(3000)
-                _status.value = PowStatus.Idle
+                updateStatus(token, PowStatus.Idle)
             }
         }
         return true
     }
 
+    @Synchronized
+    private fun updateProgress(token: Long, progress: PowStatus.Mining) {
+        if (token == generation && _status.value is PowStatus.Mining) _status.value = progress
+    }
+
+    @Synchronized
+    private fun updateStatus(token: Long, status: PowStatus) {
+        if (token == generation) _status.value = status
+    }
+
+    @Synchronized
     fun cancel() {
         generation++
         miningJob?.cancel()

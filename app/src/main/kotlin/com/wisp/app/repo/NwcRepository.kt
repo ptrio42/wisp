@@ -65,6 +65,37 @@ class NwcRepository(private val context: Context, private val relayPool: RelayPo
         _statusLog.tryEmit(msg)
     }
 
+    /** Outcome of the setup-flow verification round-trip. */
+    sealed class VerifyOutcome {
+        /**
+         * The wallet service answered the get_balance round-trip.
+         * [balanceMsats] carries the answer so setup can skip a second
+         * identical fetch right after verifying.
+         */
+        data class Confirmed(val balanceMsats: Long) : VerifyOutcome()
+
+        /**
+         * The wallet service answered with a NIP-47 RPC error. UNAUTHORIZED
+         * means the client secret was rejected — the connection was revoked
+         * or re-issued.
+         */
+        data class Refused(val code: String, val message: String?) : VerifyOutcome()
+
+        /**
+         * No answer at all: the service is offline, the relay path is dead,
+         * or the wallet silently dropped the request.
+         */
+        object Unresponsive : VerifyOutcome()
+    }
+
+    /**
+     * NIP-47 error answered by the wallet service. Keeps the code separate
+     * from the combined message so callers (setup verification) can tell a
+     * wallet refusal apart from a transport failure.
+     */
+    class NwcRpcException(val code: String, val rpcMessage: String) :
+        Exception(if (rpcMessage.isBlank()) code else "$code: $rpcMessage")
+
     override fun hasConnection(): Boolean = encPrefs.getString("nwc_uri", null) != null
 
     fun saveConnectionString(uri: String) {
@@ -163,6 +194,46 @@ class NwcRepository(private val context: Context, private val relayPool: RelayPo
         }
 
         r.connect()
+    }
+
+    /**
+     * One `get_balance` round-trip with a short timeout, used by the setup
+     * flow to prove the wallet service actually answers. [connect] only
+     * opens the relay subscription — a revoked or offline connection opens
+     * one fine and would otherwise look successful until the dashboard's
+     * first real request timed out with no explanation. `get_balance` over
+     * `get_info` because it's in every wallet's required method set while
+     * `get_info` is skippable.
+     *
+     * The timeout caps the whole call — including [sendRequest]'s internal
+     * wait for negotiation/subscription readiness — so a revoked or offline
+     * string alerts within seconds even on a cold relay.
+     */
+    suspend fun verify(timeoutMs: Long = 6_000): VerifyOutcome {
+        if (!_isConnected.value) return VerifyOutcome.Unresponsive
+        val result = withTimeoutOrNull(timeoutMs) {
+            sendRequest(Nip47.NwcRequest.GetBalance)
+        }
+        val error = result?.exceptionOrNull()
+        return when {
+            result == null -> VerifyOutcome.Unresponsive
+            error is NwcRpcException ->
+                VerifyOutcome.Refused(error.code, error.rpcMessage.takeIf { it.isNotBlank() })
+            else -> {
+                val balance = result.getOrNull() as? Nip47.NwcResponse.Balance
+                // A success that isn't a balance payload means the answer
+                // didn't survive parsing — treat it like silence rather
+                // than success.
+                if (balance == null) {
+                    VerifyOutcome.Unresponsive
+                } else {
+                    // Mirror fetchBalance()'s side effect so repo-level
+                    // state stays fresh when setup skips the refetch.
+                    _balance.value = balance.balanceMsats
+                    VerifyOutcome.Confirmed(balance.balanceMsats)
+                }
+            }
+        }
     }
 
     /**
@@ -279,7 +350,7 @@ class NwcRepository(private val context: Context, private val relayPool: RelayPo
         val response = deferred.await()
         return if (response is Nip47.NwcResponse.Error) {
             emitStatus("Wallet error: ${response.code}")
-            Result.failure(Exception("${response.code}: ${response.message}"))
+            Result.failure(NwcRpcException(response.code, response.message))
         } else {
             emitStatus("Success")
             Result.success(response)
@@ -385,6 +456,14 @@ class NwcRepository(private val context: Context, private val relayPool: RelayPo
         }
     }
 
+    suspend fun disconnectAndJoin() {
+        val oldJob = scope?.coroutineContext?.get(kotlinx.coroutines.Job)
+        disconnect()
+        oldJob?.join()
+        // A cancelled negotiation may have been returning when disconnect ran.
+        disconnect()
+    }
+
     override fun disconnect() {
         scope?.cancel()
         scope = null
@@ -393,6 +472,12 @@ class NwcRepository(private val context: Context, private val relayPool: RelayPo
         connection = null
         _isReady.value = false
         _isConnected.value = false
+        _balance.value = null
+        _nodeAlias.value = null
+        _supportedMethods.value = emptyList()
+        _connectionInfo.value = null
+        pendingRequests.values.toList().forEach { it.cancel() }
+        pendingRequests.clear()
     }
 
     private fun createEncPrefs(pubkeyHex: String?) = EncryptedSharedPreferences.create(

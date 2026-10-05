@@ -157,6 +157,7 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
     private var latestRelayListTimestamp: Long = 0
 
     companion object {
+        private val PUBLIC_POST_KINDS = setOf(1, Nip22.KIND_COMMENT, 20, 21, 22, 1068, 6969)
         private val SUB_IDS = setOf("userprofile", "userposts", "usergallery", "userfollows", "userrelays", "userpins", "usergroups", "followprofiles")
     }
 
@@ -332,7 +333,7 @@ class UserProfileViewModel(app: Application) : AndroidViewModel(app) {
                     relayListRepo?.updateFromEvent(event)
                 }
                 if (event.pubkey == pubkey) {
-                    if (event.kind in setOf(1, Nip22.KIND_COMMENT, 20, 21, 22, 1068, 6969)) {
+                    if (event.kind in PUBLIC_POST_KINDS) {
                         eventRepo.addEventRelay(event.id, relayUrl)
                     }
                     when (event.kind) {

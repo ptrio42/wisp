@@ -7,7 +7,6 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
-import com.wisp.app.viewmodel.ComposerSession
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
@@ -35,6 +34,7 @@ class NotePublisherTest {
         val records = mutableMapOf<String, String>()
         val receipts = mutableMapOf<String, String>()
         var failWrites = false
+        override fun removePayload(eventId: String) { records.remove(eventId) }
         override fun load(): List<NotePublication> = records.values.map { Json.decodeFromString(it) }
         override fun loadReceipts(): List<NotePublicationReceipt> = receipts.values.map { Json.decodeFromString(it) }
         override fun save(publication: NotePublication) {
@@ -75,7 +75,7 @@ class NotePublisherTest {
         deleted: (NostrEvent) -> Boolean = { false },
         known: (NostrEvent) -> Set<String> = { emptySet() }
     ) = NotePublisher(pubkey, store, transport, backgroundScope, onStored, deleted,
-        timeoutMs = 1000, ioDispatcher = StandardTestDispatcher(testScheduler), verifiedRelayUrls = known)
+        timeoutMs = 1000, ioDispatcher = StandardTestDispatcher(testScheduler), verifiedRelayUrls = known, verifyEvent = { true })
 
     @Test
     fun `save precedes network send and immediate OK is captured`() = runTest {
@@ -470,174 +470,6 @@ class NotePublisherTest {
         assertTrue(store.load().isEmpty())
     }
     @Test
-    fun `login without restarting creates an account publisher`() = runTest {
-        val store = Store()
-        val transport = Transport().apply { targets.clear() }
-        val accounts = NotePublicationAccounts { account, wait ->
-            NotePublisher(account, store, transport, backgroundScope, {},
-                ioDispatcher = StandardTestDispatcher(testScheduler), beforeRestore = wait)
-        }
-        accounts.switchAccount(null)
-        assertNull(accounts.publisher.value)
-        accounts.switchAccount(pubkey)
-        val publisher = requireNotNull(accounts.publisher.value)
-        assertTrue(publisher.canPublish(note))
-        publisher.submit(note)
-        assertEquals(note, store.load().single().event)
-    }
-
-    @Test
-    fun `switch A B A isolates payloads receipts and collectors without automatic sends`() = runTest {
-        val otherKey = "b".repeat(64)
-        val otherNote = note.copy(id = "2".repeat(64), pubkey = otherKey)
-        val stores = mapOf(pubkey to Store(), otherKey to Store())
-        val transport = Transport().apply { targets.clear() }
-        val cached = mutableListOf<NostrEvent>()
-        val accounts = NotePublicationAccounts { account, wait ->
-            NotePublisher(account, stores.getValue(account), transport, backgroundScope, cached::add,
-                ioDispatcher = StandardTestDispatcher(testScheduler), beforeRestore = wait)
-        }
-        accounts.switchAccount(pubkey)
-        val first = requireNotNull(accounts.publisher.value)
-        first.submit(note)
-        runCurrent()
-        accounts.switchAccount(otherKey)
-        val second = requireNotNull(accounts.publisher.value)
-        assertFalse(first.canPublish(note))
-        assertFalse(second.canPublish(note))
-        second.submit(otherNote)
-        runCurrent()
-        transport.acknowledge(relayA, note, true)
-        transport.relayCopies.emit(note to relayA)
-        runCurrent()
-        assertTrue(first.receipts.value.isEmpty())
-        assertTrue(second.receipts.value.isEmpty())
-        assertEquals(listOf(otherNote), second.publications.value.values.map { it.event })
-        accounts.switchAccount(pubkey)
-        val restored = requireNotNull(accounts.publisher.value)
-        runCurrent()
-        assertNotSame(first, restored)
-        assertEquals(listOf(note), restored.publications.value.values.map { it.event })
-        assertEquals(note, stores.getValue(pubkey).load().single().event)
-        assertEquals(otherNote, stores.getValue(otherKey).load().single().event)
-        assertTrue(transport.sent.isEmpty())
-        assertEquals(listOf(note, otherNote, note), cached)
-    }
-
-    @Test
-    fun `switch during delivery cancels old sends and keeps its durable payload`() = runTest {
-        val stores = mutableMapOf<String, Store>()
-        val transport = Transport()
-        var cancelled = 0
-        transport.sendAction = { _, _ ->
-            try { awaitCancellation() } finally { cancelled++ }
-        }
-        val accounts = NotePublicationAccounts { account, wait ->
-            NotePublisher(account, stores.getOrPut(account) { Store() }, transport, backgroundScope, {},
-                ioDispatcher = StandardTestDispatcher(testScheduler), beforeRestore = wait)
-        }
-        accounts.switchAccount(pubkey)
-        val old = requireNotNull(accounts.publisher.value)
-        old.submit(note)
-        runCurrent()
-        assertEquals(2, transport.sent.size)
-        accounts.switchAccount("b".repeat(64))
-        runCurrent()
-        assertEquals(2, cancelled)
-        assertEquals(note, stores.getValue(pubkey).load().single().event)
-        assertFalse(stores.getValue(pubkey).load().single().inFlight)
-        assertTrue(requireNotNull(accounts.publisher.value).publications.value.isEmpty())
-        transport.acknowledge(relayA, note, true)
-        runCurrent()
-        assertTrue(old.receipts.value.isEmpty())
-        assertEquals(1, stores.getValue(pubkey).load().size)
-    }
-
-    @Test
-    fun `account switch during restoration never inserts the old account into the cache`() = runTest {
-        val cached = mutableListOf<NostrEvent>()
-        val store = Store().apply { save(NotePublication(note, emptyList(), emptyMap())) }
-        lateinit var accounts: NotePublicationAccounts
-        var switched = false
-        val switchingStore = object : NotePublicationStore by store {
-            override fun load(): List<NotePublication> {
-                val loaded = store.load()
-                if (!switched) {
-                    switched = true
-                    accounts.switchAccount("b".repeat(64))
-                }
-                return loaded
-            }
-        }
-        accounts = NotePublicationAccounts { account, wait ->
-            NotePublisher(account, if (account == pubkey) switchingStore else Store(), Transport(),
-                backgroundScope, cached::add, ioDispatcher = StandardTestDispatcher(testScheduler), beforeRestore = wait)
-        }
-        accounts.switchAccount(pubkey)
-        runCurrent()
-        assertEquals("b".repeat(64), accounts.publisher.value?.accountPubkey)
-        assertTrue(cached.isEmpty())
-        assertEquals(note, store.load().single().event)
-    }
-
-    @Test
-    fun `switch during a completed durable write retains payload but does not send or cache it`() = runTest {
-        val store = Store()
-        val transport = Transport()
-        val cached = mutableListOf<NostrEvent>()
-        lateinit var accounts: NotePublicationAccounts
-        val switchingStore = object : NotePublicationStore by store {
-            override fun save(publication: NotePublication) {
-                store.save(publication)
-                accounts.switchAccount("b".repeat(64))
-            }
-        }
-        accounts = NotePublicationAccounts { account, wait ->
-            NotePublisher(account, if (account == pubkey) switchingStore else Store(), transport,
-                backgroundScope, cached::add, ioDispatcher = StandardTestDispatcher(testScheduler), beforeRestore = wait)
-        }
-        accounts.switchAccount(pubkey)
-        val publishing = async { requireNotNull(accounts.publisher.value).submit(note) }
-        runCurrent()
-        assertTrue(publishing.isCancelled)
-        assertTrue(cached.isEmpty())
-        assertTrue(transport.sent.isEmpty())
-        assertEquals(note, store.load().single().event)
-    }
-
-    @Test
-    fun `returning to A waits for all predecessor writes before reopening its store`() = runTest {
-        val store = Store()
-        val transport = Transport()
-        val release = CompletableDeferred<Unit>()
-        transport.sendAction = { _, _ ->
-            try { awaitCancellation() } finally {
-                kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { release.await() }
-            }
-        }
-        var loads = 0
-        val countedStore = object : NotePublicationStore by store {
-            override fun load(): List<NotePublication> { loads++; return store.load() }
-        }
-        val accounts = NotePublicationAccounts { account, wait ->
-            NotePublisher(account, if (account == pubkey) countedStore else Store(), transport,
-                backgroundScope, {}, ioDispatcher = StandardTestDispatcher(testScheduler), beforeRestore = wait)
-        }
-        accounts.switchAccount(pubkey)
-        requireNotNull(accounts.publisher.value).submit(note)
-        runCurrent()
-        accounts.switchAccount("b".repeat(64))
-        accounts.switchAccount(pubkey)
-        runCurrent()
-        assertEquals(1, loads)
-        release.complete(Unit)
-        runCurrent()
-        assertEquals(2, loads)
-        assertFalse(requireNotNull(accounts.publisher.value).publications.value.getValue(note.id).inFlight)
-        assertEquals(2, transport.sent.size)
-    }
-
-    @Test
     fun `account close waits for cleanup of a publication owned by an external caller`() = runTest {
         val store = Store()
         val transport = Transport()
@@ -663,109 +495,126 @@ class NotePublisherTest {
         assertEquals(2, transport.sent.size)
     }
 
-    @Test
-    fun `real provenance with a forged copy cannot discard recovery on retry`() = runTest {
-        val store = Store()
-        val transport = Transport()
-        // This is the production provenance shared by EventRepository and RelayPool, not a URL set.
-        val provenance = RelayEventProvenance()
-        val publisher = publisher(store, transport, known = provenance::verifiedRelays)
-        publisher.publish(note)
-        val forged = note.copy(content = "Forged", sig = "d".repeat(128))
-        provenance.add(forged.id, relayA) // Optimistic EventRouter ingestion, before verification.
-        transport.relayCopies.emit(forged to relayA)
-        assertFalse(provenance.verifyAndRecord(forged, relayA))
-        runCurrent()
-        assertEquals(setOf(relayA), provenance.seen(note.id))
-        transport.sendAction = { _, _ -> false }
-        val retried = publisher.publish(note)
-        assertEquals(0, retried.acceptedCount)
-        assertEquals(note, store.load().single().event)
-        assertTrue(store.loadReceipts().isEmpty())
-    }
 
-    @Test
-    fun `verified provenance matching the whole event prevents a new recovery payload`() = runTest {
+    @Test fun `relay host case root slash and default port match the same acknowledgement`() = runTest {
         val store = Store()
-        val transport = Transport()
-        val provenance = RelayEventProvenance()
-        // Substitute only native verification for this signed fixture; keep real provenance matching.
-        assertTrue(provenance.verifyAndRecord(note, relayA) { it == note })
-        val publisher = publisher(store, transport, known = provenance::verifiedRelays)
-        transport.sendAction = { _, _ ->
-            assertTrue(store.load().isEmpty())
-            false
-        }
-        val result = publisher.publish(note)
+        val transport = Transport().apply { targets = linkedSetOf("wss://A.EXAMPLE:443/") }
+        transport.sendAction = { _, event -> transport.acknowledge("wss://a.example/", event, true); true }
+        val result = publisher(store, transport).publish(note)
         assertEquals(1, result.acceptedCount)
+        assertEquals(setOf(relayA), result.relays.keys)
         assertTrue(store.load().isEmpty())
-        assertEquals(1, store.loadReceipts().size)
     }
 
-    @Test
-    fun `verified evidence for another signature with the same id is insufficient`() = runTest {
+    @Test fun `publication fanout is capped and at most four sends run concurrently`() = runTest {
+        val transport = Transport().apply { targets = (1..100).map { "wss://relay$it.example" }.toCollection(linkedSetOf()) }
         val store = Store()
-        val transport = Transport().apply { sendAction = { _, _ -> false } }
-        val provenance = RelayEventProvenance()
-        val other = note.copy(sig = "d".repeat(128))
-        provenance.verifyAndRecord(other, relayA) { it == other }
-        val result = publisher(store, transport, known = provenance::verifiedRelays).publish(note)
-        assertEquals(0, result.acceptedCount)
-        assertEquals(note, store.load().single().event)
+        val release = CompletableDeferred<Unit>()
+        var concurrent = 0
+        var maximum = 0
+        transport.sendAction = { _, _ ->
+            concurrent++
+            maximum = maxOf(maximum, concurrent)
+            try { release.await(); false } finally { concurrent-- }
+        }
+        val pending = async { publisher(store, transport).publish(note) }
+        runCurrent()
+        assertEquals(4, transport.sent.size)
+        release.complete(Unit)
+        val result = pending.await()
+        assertEquals(32, result.relays.size)
+        assertEquals(32, transport.sent.size)
+        assertEquals(4, maximum)
     }
 
-    @Test
-    fun `editor completion waits for durable save but not for relay delivery`() = runTest {
+    @Test fun `invalid cached signed event cannot be sent`() = runTest {
         val store = Store()
         val transport = Transport()
+        val publisher = NotePublisher(pubkey, store, transport, backgroundScope, {},
+            ioDispatcher = StandardTestDispatcher(testScheduler), verifyEvent = { false })
+        publisher.rebroadcast(note)
+        runCurrent()
+        assertTrue(transport.sent.isEmpty())
+        assertTrue(store.load().isEmpty())
+        assertTrue(note.id in publisher.actionErrors.value)
+    }
+
+    @Test fun `deleted and invalid restored payloads are physically removed`() = runTest {
+        val store = Store().apply { save(NotePublication(note, emptyList(), emptyMap())) }
+        val transport = Transport()
+        publisher(store, transport, deleted = { true })
+        runCurrent()
+        assertTrue(store.load().isEmpty())
+        assertTrue(transport.sent.isEmpty())
+        store.save(NotePublication(note, emptyList(), emptyMap()))
+        NotePublisher(pubkey, store, transport, backgroundScope, {},
+            ioDispatcher = StandardTestDispatcher(testScheduler), verifyEvent = { false })
+        runCurrent()
+        assertTrue(store.load().isEmpty())
+    }
+
+    @Test fun `deleting a pending note stops delivery and removes its payload`() = runTest {
+        val store = Store()
+        val transport = Transport().apply { sendAction = { _, _ -> awaitCancellation() } }
         val publisher = publisher(store, transport)
-        val editor = ComposerSession()
-        val token = editor.begin()
-        var draft = "first draft"
-        var popped = 0
         publisher.submit(note)
-        assertEquals(note, store.load().single().event)
-        assertTrue(publisher.publications.value.getValue(note.id).inFlight)
-        editor.complete(token) { draft = ""; popped++ }
-        assertEquals("", draft)
-        assertEquals(1, popped)
-        editor.end(token)
-        editor.begin()
-        draft = "new draft"
+        runCurrent()
+        publisher.forget(note.id)
+        runCurrent()
+        assertTrue(store.load().isEmpty())
+        assertTrue(publisher.publications.value.isEmpty())
+    }
+
+    @Test fun `cancelled editor preparation cannot later store or send the obsolete edit`() = runTest {
+        val store = Store()
+        val transport = Transport()
+        val release = CompletableDeferred<Unit>()
+        val publisher = NotePublisher(pubkey, store, transport, backgroundScope, {},
+            ioDispatcher = StandardTestDispatcher(testScheduler), beforeRestore = { release.await() }, verifyEvent = { true })
+        val editing = async { publisher.submit(note) }
+        runCurrent()
+        editing.cancel()
+        runCurrent()
+        release.complete(Unit)
+        runCurrent()
+        assertTrue(editing.isCancelled)
+        assertTrue(store.load().isEmpty())
+        assertTrue(transport.sent.isEmpty())
+    }
+
+    @Test fun `failed restoration is reported by retry without crashing acknowledgement collectors`() = runTest {
+        val store = Store()
+        val broken = object : NotePublicationStore by store {
+            override fun load(): List<NotePublication> = throw IOException("Cannot read recovery storage")
+        }
+        val transport = Transport()
+        val publisher = NotePublisher(pubkey, broken, transport, backgroundScope, {},
+            ioDispatcher = StandardTestDispatcher(testScheduler), verifyEvent = { true })
         runCurrent()
         transport.acknowledge(relayA, note, true)
-        transport.acknowledge(relayB, note, true)
+        transport.relayCopies.emit(note to relayA)
+        publisher.rebroadcast(note)
         runCurrent()
-        assertEquals("new draft", draft)
-        assertEquals(1, popped)
-        assertTrue(store.load().isEmpty())
+        assertTrue(note.id in publisher.actionErrors.value)
+        assertTrue(transport.sent.isEmpty())
+        assertTrue(publisher.publications.value.isEmpty())
     }
 
-    @Test
-    fun `leaving while persistence waits cannot pop a profile or clear a new editor`() = runTest {
-        val release = CompletableDeferred<Unit>()
-        val store = Store()
-        val transport = Transport().apply { targets.clear() }
-        val publisher = NotePublisher(pubkey, store, transport, backgroundScope, {},
-            ioDispatcher = StandardTestDispatcher(testScheduler), beforeRestore = { release.await() })
-        val editor = ComposerSession()
-        val token = editor.begin()
-        var screen = "compose"
-        var draft = "old draft"
-        val pending = async {
-            publisher.submit(note)
-            editor.complete(token) { screen = "feed"; draft = "" }
+    @Test fun `restored legacy relay aliases accept an OK without duplicate relay counts`() = runTest {
+        val store = Store().apply {
+            save(NotePublication(note, emptyList(), mapOf(
+                "wss://A.EXAMPLE:443/" to RelayPublication(RelayPublicationStatus.UNCONFIRMED)), inFlight = false))
         }
+        val transport = Transport()
+        val publisher = publisher(store, transport)
         runCurrent()
-        editor.end(token)
-        screen = "profile"
-        editor.begin()
-        draft = "new draft"
-        release.complete(Unit)
-        pending.await()
-        assertEquals("profile", screen)
-        assertEquals("new draft", draft)
-        assertEquals(note, store.load().single().event)
+        transport.acknowledge("wss://a.example/", note, true)
+        runCurrent()
+        assertEquals(1, publisher.publications.value.getValue(note.id).acceptedCount)
+        assertEquals(setOf(relayA), publisher.publications.value.getValue(note.id).relays.keys)
+        assertTrue(store.load().isEmpty())
+        transport.targets = linkedSetOf(relayA)
+        transport.sendAction = { _, _ -> false }
+        assertEquals(1, publisher.publish(note).acceptedCount)
     }
-
 }

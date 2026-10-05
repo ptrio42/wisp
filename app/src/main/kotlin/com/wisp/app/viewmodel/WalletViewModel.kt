@@ -137,6 +137,8 @@ class WalletViewModel(
     val relayPool: RelayPool,
     val keyRepo: KeyRepository,
 ) : ViewModel() {
+    private val accountScope = AccountSessionScope(viewModelScope)
+    private var accountSuspended = false
 
     private val _walletMode = MutableStateFlow(walletModeRepo.getMode())
     val walletMode: StateFlow<WalletMode> = _walletMode
@@ -369,7 +371,7 @@ class WalletViewModel(
         // Auto-navigate to success screen when an incoming payment is received
         viewModelScope.launch {
             sparkRepo.paymentReceived.collect { amountMsats ->
-                if (_currentPage.value is WalletPage.ReceiveInvoice) {
+                if (!accountSuspended && _walletMode.value == WalletMode.SPARK && _currentPage.value is WalletPage.ReceiveInvoice) {
                     stopSyncPolling()
                     val amountSats = amountMsats / 1000
                     pageStack.removeAt(pageStack.lastIndex)
@@ -382,7 +384,7 @@ class WalletViewModel(
         }
         viewModelScope.launch {
             nwcRepo.paymentReceived.collect { amountMsats ->
-                if (_currentPage.value is WalletPage.ReceiveInvoice) {
+                if (!accountSuspended && _walletMode.value == WalletMode.NWC && _currentPage.value is WalletPage.ReceiveInvoice) {
                     val amountSats = amountMsats / 1000
                     pageStack.removeAt(pageStack.lastIndex)
                     val successPage = WalletPage.ReceiveSuccess(amountSats)
@@ -395,7 +397,7 @@ class WalletViewModel(
 
         // Auto-fetch lightning address when Spark connected
         if (mode == WalletMode.SPARK && sparkRepo.hasMnemonic()) {
-            viewModelScope.launch {
+            accountScope.launch {
                 sparkRepo.isConnected.first { it }
                 fetchLightningAddress()
             }
@@ -491,7 +493,7 @@ class WalletViewModel(
     private fun autoCheckRelayBackup() {
         val signer = buildSigner() ?: return
         _autoCheckState.value = AutoCheckState.Checking
-        viewModelScope.launch {
+        accountScope.launch {
             try {
                 val t0 = System.currentTimeMillis()
                 relayPool.ensureWriteRelaysConnected()
@@ -641,7 +643,7 @@ class WalletViewModel(
         if (_nwcRestoreState.value is NwcRestoreState.Searching) return
         nwcRestoreJob?.cancel()
         _nwcRestoreState.value = NwcRestoreState.Searching
-        nwcRestoreJob = viewModelScope.launch {
+        nwcRestoreJob = accountScope.launch {
             try {
                 relayPool.ensureWriteRelaysConnected()
                 val pubkey = signer.pubkeyHex
@@ -708,7 +710,7 @@ class WalletViewModel(
         if (state is NwcRestoreState.Found) {
             _nwcRestoreState.value = NwcRestoreState.Idle
             _connectionString.value = state.uri
-            connectNwcWallet(state.uri)
+            connectNwcWallet(state.uri, verifySetup = true)
         }
     }
 
@@ -739,7 +741,11 @@ class WalletViewModel(
         _connectionString.value = value
     }
 
-    fun connectNwcWallet(uri: String = _connectionString.value, silent: Boolean = false) {
+    fun connectNwcWallet(
+        uri: String = _connectionString.value,
+        silent: Boolean = false,
+        verifySetup: Boolean = false
+    ) {
         val trimmed = uri.trim()
         if (trimmed.isEmpty()) return
 
@@ -766,7 +772,7 @@ class WalletViewModel(
 
         startStatusCollection(nwcRepo)
         nwcRepo.connect()
-        startConnectionMonitor(nwcRepo)
+        startConnectionMonitor(nwcRepo, verifySetup = verifySetup)
     }
 
     // --- Spark Connection ---
@@ -823,7 +829,7 @@ class WalletViewModel(
         startConnectionMonitor(sparkRepo)
 
         // Fetch lightning address and check relay backup once connected
-        viewModelScope.launch {
+        accountScope.launch {
             sparkRepo.isConnected.first { it }
             fetchLightningAddress()
             if (keyRepo.isLoggedIn() && !computeIsDefaultWallet()) {
@@ -852,17 +858,17 @@ class WalletViewModel(
 
     private fun startStatusCollection(provider: WalletProvider) {
         statusCollectJob?.cancel()
-        statusCollectJob = viewModelScope.launch {
+        statusCollectJob = accountScope.launch {
             provider.statusLog.collect { line ->
                 _statusLines.value = _statusLines.value + line
             }
         }
     }
 
-    private fun startConnectionMonitor(provider: WalletProvider) {
+    private fun startConnectionMonitor(provider: WalletProvider, verifySetup: Boolean = false) {
         connectJob?.cancel()
         val timeoutMs = if (_walletMode.value == WalletMode.SPARK) 60_000L else 20_000L
-        connectJob = viewModelScope.launch {
+        connectJob = accountScope.launch {
             val connected = kotlinx.coroutines.withTimeoutOrNull(timeoutMs) {
                 provider.isConnected.first { it }
             }
@@ -873,10 +879,37 @@ class WalletViewModel(
         }
 
         connectionMonitorJob?.cancel()
-        connectionMonitorJob = viewModelScope.launch {
+        connectionMonitorJob = accountScope.launch {
+            // Verify at most once per setup connect — a relay auto-reconnect
+            // re-emits connected=true and only needs the balance refetch,
+            // not another verification round-trip.
+            var verified = false
             provider.isConnected.collect { connected ->
                 if (connected) {
-                    val result = provider.fetchBalance()
+                    // Opening the subscription says nothing about whether
+                    // the wallet service still answers — a revoked URI
+                    // "connects" fine and the dashboard's balance fetch
+                    // would only fail, silently, later with no explanation.
+                    // One short round-trip proves the service is alive so
+                    // setup can alert within seconds. Only the setup flow
+                    // (paste / restore-from-backup) verifies; app-launch
+                    // and account-switch reconnects keep the fast path.
+                    var verifiedBalanceMsats: Long? = null
+                    if (verifySetup && provider === nwcRepo && !verified) {
+                        verified = true
+                        val outcome = nwcRepo.verify(NWC_VERIFY_TIMEOUT_MS)
+                        if (outcome !is NwcRepository.VerifyOutcome.Confirmed) {
+                            failNwcSetup(nwcSetupFailureMessage(outcome))
+                            return@collect
+                        }
+                        // verify() just made the get_balance round-trip —
+                        // reuse its answer instead of sending the same
+                        // request again. Only this first emission skips the
+                        // refetch; a later reconnect re-fetches.
+                        verifiedBalanceMsats = outcome.balanceMsats
+                    }
+                    val result = verifiedBalanceMsats?.let { Result.success(it) }
+                        ?: provider.fetchBalance()
                     result.fold(
                         onSuccess = { balanceMsats ->
                             _walletState.value = WalletState.Connected(balanceMsats)
@@ -916,8 +949,31 @@ class WalletViewModel(
         }
     }
 
+    /**
+     * Tear a failed NWC setup attempt down and leave the reason on the error
+     * state the setup sheet reads. Cancelling the status collector first
+     * stops the wallet's still-buffered status lines from appending after
+     * the failure lands. The URI stays saved either way — an offline wallet
+     * may come back, and pasting a new string overwrites it.
+     *
+     * Runs inside connectionMonitorJob's collect: cancelling that job here
+     * means every step afterwards must be non-suspend from the caller's
+     * perspective — the repo teardown's join ([disconnectAndJoin], which
+     * awaits the repository's own scope) is dispatched to the ViewModel
+     * scope, since awaiting from the just-cancelled coroutine would throw
+     * CancellationException at the suspension point.
+     */
+    private fun failNwcSetup(message: String) {
+        statusCollectJob?.cancel()
+        statusCollectJob = null
+        connectJob?.cancel()
+        connectionMonitorJob?.cancel()
+        _walletState.value = WalletState.Error(message)
+        viewModelScope.launch { nwcRepo.disconnectAndJoin() }
+    }
+
     fun refreshBalance() {
-        viewModelScope.launch {
+        accountScope.launch {
             val result = activeProvider.fetchBalance()
             result.fold(
                 onSuccess = { balanceMsats ->
@@ -1016,22 +1072,34 @@ class WalletViewModel(
      * stored credentials. The new account's wallet will be loaded by refreshState()
      * after the repo reload completes.
      */
-    fun suspendForAccountSwitch() {
-        connectJob?.cancel()
-        statusCollectJob?.cancel()
-        connectionMonitorJob?.cancel()
-
-        when (_walletMode.value) {
-            WalletMode.NWC -> nwcRepo.disconnect()
-            WalletMode.SPARK -> sparkRepo.disconnect()
-            WalletMode.NONE -> {}
-        }
+    suspend fun suspendForAccountSwitch() {
+        accountSuspended = true
+        navigateHome()
+        accountScope.stop()
+        nwcRepo.disconnectAndJoin()
+        sparkRepo.disconnectAndJoin()
 
         _walletMode.value = WalletMode.NONE
         _walletState.value = WalletState.NotConnected
         _connectionString.value = ""
         _statusLines.value = emptyList()
         clearWalletDisplayState()
+        navigateHome()
+        clearFeeState()
+        _isLoading.value = false
+        _isLoadingMore.value = false
+        _addressCheckLoading.value = false
+        _showBioPrompt.value = false
+        _registeredAddress.value = null
+        _backupStatus.value = BackupStatus.None
+        _restoreFromRelayStatus.value = RestoreFromRelayStatus.Idle
+        _autoCheckState.value = AutoCheckState.Idle
+        _nwcRestoreState.value = NwcRestoreState.Idle
+        _relayBackupStatuses.value = emptyList()
+        _relayBackupCheckLoading.value = false
+        _deleteBackupStatus.value = DeleteBackupStatus.Idle
+        _backupMissing.value = false
+        _isDefaultWallet.value = false
     }
 
     fun updateDeleteConfirmText(value: String) {
@@ -1039,6 +1107,9 @@ class WalletViewModel(
     }
 
     fun refreshState() {
+        accountScope.start()
+        accountSuspended = false
+        _balanceUnit.value = walletModeRepo.getBalanceUnit()
         _walletMode.value = walletModeRepo.getMode()
         _isDefaultWallet.value = computeIsDefaultWallet()
         _seedBackupAcked.value = sparkRepo.isSeedBackupAcknowledged()
@@ -1074,7 +1145,7 @@ class WalletViewModel(
 
     fun fetchLightningAddress() {
         if (_walletMode.value != WalletMode.SPARK) return
-        viewModelScope.launch {
+        accountScope.launch {
             _lightningAddressLoading.value = true
             val result = sparkRepo.getLightningAddress()
             result.fold(
@@ -1091,7 +1162,7 @@ class WalletViewModel(
         _addressCheckLoading.value = true
         _addressAvailable.value = null
         _lightningAddressError.value = null
-        viewModelScope.launch {
+        accountScope.launch {
             val result = sparkRepo.checkLightningAddressAvailable(username)
             result.fold(
                 onSuccess = { available ->
@@ -1111,7 +1182,7 @@ class WalletViewModel(
     fun registerLightningAddress(username: String) {
         _lightningAddressLoading.value = true
         _lightningAddressError.value = null
-        viewModelScope.launch {
+        accountScope.launch {
             val result = sparkRepo.registerLightningAddress(username)
             result.fold(
                 onSuccess = { fullAddress ->
@@ -1140,7 +1211,7 @@ class WalletViewModel(
         val pubkeyHex = keyRepo.getPubkeyHex() ?: return
         _showBioPrompt.value = false
 
-        viewModelScope.launch {
+        accountScope.launch {
             try {
                 val profile = eventRepo.getProfileData(pubkeyHex)
 
@@ -1176,7 +1247,7 @@ class WalletViewModel(
     fun deleteLightningAddress() {
         _lightningAddressLoading.value = true
         _lightningAddressError.value = null
-        viewModelScope.launch {
+        accountScope.launch {
             val result = sparkRepo.deleteLightningAddress()
             result.fold(
                 onSuccess = {
@@ -1257,7 +1328,7 @@ class WalletViewModel(
 
     fun resolveLightningAddress(address: String, amountSats: Long) {
         _isLoading.value = true
-        viewModelScope.launch {
+        accountScope.launch {
             try {
                 val payInfo = Nip57.resolveLud16(address, httpClient)
                 if (payInfo == null) {
@@ -1301,7 +1372,7 @@ class WalletViewModel(
             return
         }
         _feeState.value = FeeState.Loading
-        viewModelScope.launch {
+        accountScope.launch {
             sparkRepo.prepareSendPayment(invoice).fold(
                 onSuccess = { (feeSats, prepareData) ->
                     _preparedPaymentData = prepareData
@@ -1321,7 +1392,7 @@ class WalletViewModel(
 
     fun payInvoice(invoice: String) {
         navigateTo(WalletPage.Sending(invoice))
-        viewModelScope.launch {
+        accountScope.launch {
             val preparedData = _preparedPaymentData
             clearFeeState()
 
@@ -1357,7 +1428,7 @@ class WalletViewModel(
      * refreshState runs.
      */
     fun withdrawOnchain(quote: WithdrawOnchainQuote): Deferred<Result<String>> =
-        viewModelScope.async {
+        accountScope.async {
             val result = sparkRepo.executeWithdrawOnchain(quote)
             if (result.isSuccess) refreshState()
             result
@@ -1389,7 +1460,7 @@ class WalletViewModel(
 
     fun generateInvoice(amountSats: Long, description: String = "", expirySecs: Int = 3600) {
         _isLoading.value = true
-        viewModelScope.launch {
+        accountScope.launch {
             val result = activeProvider.makeInvoice(amountSats * 1000, description, expirySecs)
             result.fold(
                 onSuccess = { invoice ->
@@ -1410,7 +1481,7 @@ class WalletViewModel(
         _isLoading.value = true
         _transactionsError.value = null
         _hasMoreTransactions.value = true
-        viewModelScope.launch {
+        accountScope.launch {
             // Kick off sync + zap receipt fetch in background (don't block)
             if (_walletMode.value == WalletMode.SPARK) {
                 launch { sparkRepo.syncWallet() }
@@ -1487,7 +1558,7 @@ class WalletViewModel(
             .filter { eventRepo.getProfileData(it) == null }
         missing.forEach { eventRepo.requestProfileIfMissing(it) }
         if (missing.isNotEmpty()) {
-            viewModelScope.launch {
+            accountScope.launch {
                 delay(3_000)
                 _profileRefreshKey.value++
             }
@@ -1497,7 +1568,7 @@ class WalletViewModel(
     fun loadMoreTransactions() {
         if (_isLoadingMore.value) return
         _isLoadingMore.value = true
-        viewModelScope.launch {
+        accountScope.launch {
             val currentSize = _transactions.value.size
             val mapped = withContext(Dispatchers.IO) {
                 val zapMaps = eventRepo.getZapReceiptCounterparties()
@@ -1524,7 +1595,7 @@ class WalletViewModel(
                         .filter { eventRepo.getProfileData(it) == null }
                     missing.forEach { eventRepo.requestProfileIfMissing(it) }
                     if (missing.isNotEmpty()) {
-                        viewModelScope.launch {
+                        accountScope.launch {
                             delay(3_000)
                             _profileRefreshKey.value++
                         }
@@ -1616,7 +1687,7 @@ class WalletViewModel(
     private fun startSyncPolling() {
         syncPollJob?.cancel()
         if (_walletMode.value != WalletMode.SPARK) return
-        syncPollJob = viewModelScope.launch {
+        syncPollJob = accountScope.launch {
             while (_currentPage.value is WalletPage.ReceiveInvoice) {
                 sparkRepo.syncWallet()
                 delay(3_000)
@@ -1649,7 +1720,7 @@ class WalletViewModel(
         }
 
         _backupStatus.value = BackupStatus.InProgress
-        viewModelScope.launch {
+        accountScope.launch {
             try {
                 val t0 = System.currentTimeMillis()
                 relayPool.ensureWriteRelaysConnected()
@@ -1689,7 +1760,7 @@ class WalletViewModel(
         }
 
         _restoreFromRelayStatus.value = RestoreFromRelayStatus.Searching
-        viewModelScope.launch {
+        accountScope.launch {
             try {
                 val t0 = System.currentTimeMillis()
                 relayPool.ensureWriteRelaysConnected()
@@ -1837,7 +1908,7 @@ class WalletViewModel(
         val pubkey = keyRepo.getPubkeyHex() ?: return
 
         _relayBackupCheckLoading.value = true
-        viewModelScope.launch {
+        accountScope.launch {
             try {
                 val t0 = System.currentTimeMillis()
                 relayPool.ensureWriteRelaysConnected()
@@ -1910,7 +1981,7 @@ class WalletViewModel(
         }
 
         _deleteBackupStatus.value = DeleteBackupStatus.InProgress
-        viewModelScope.launch {
+        accountScope.launch {
             try {
                 val t0 = System.currentTimeMillis()
                 // Query relays for ALL backup events from this author
@@ -1994,5 +2065,32 @@ class WalletViewModel(
 
     fun resetDeleteBackupStatus() {
         _deleteBackupStatus.value = DeleteBackupStatus.Idle
+    }
+
+    companion object {
+        /**
+         * How long the setup flow waits for the verification round-trip before
+         * declaring the connection dead. Long enough for a slow wallet on a cold
+         * relay, short enough that a revoked or offline string alerts within a
+         * few seconds instead of "succeeding" into a silently broken dashboard.
+         */
+        private const val NWC_VERIFY_TIMEOUT_MS = 6_000L
+
+        /**
+         * User-facing wording for a failed NWC setup verification. Public for
+         * unit tests pinning the per-outcome copy, especially the
+         * UNAUTHORIZED "may have been revoked" reading.
+         */
+        fun nwcSetupFailureMessage(outcome: NwcRepository.VerifyOutcome): String = when (outcome) {
+            is NwcRepository.VerifyOutcome.Confirmed -> "Connected"
+            is NwcRepository.VerifyOutcome.Refused -> when {
+                outcome.code == "UNAUTHORIZED" ->
+                    "The wallet rejected this connection — it may have been revoked. Create a new connection string in your wallet and try again."
+                outcome.message != null -> "The wallet rejected the request: ${outcome.message}."
+                else -> "The wallet rejected the request (${outcome.code})."
+            }
+            NwcRepository.VerifyOutcome.Unresponsive ->
+                "No response from the wallet — the connection may have been revoked, or the wallet is offline."
+        }
     }
 }

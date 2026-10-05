@@ -16,8 +16,20 @@ import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class PowManagerTest {
+    private class Accounts(parent: kotlinx.coroutines.CoroutineScope, val create: (String, kotlinx.coroutines.CoroutineScope) -> NotePublisher) {
+        private val scope = AccountSessionScope(parent)
+        val publisher = kotlinx.coroutines.flow.MutableStateFlow<NotePublisher?>(null)
+        suspend fun switchAccount(pubkey: String) {
+            publisher.value?.close()
+            scope.stop()
+            scope.start()
+            publisher.value = create(pubkey, scope)
+        }
+    }
+
     private class Store : NotePublicationStore {
         val saved = linkedMapOf<String, NotePublication>()
+        override fun removePayload(eventId: String) { saved.remove(eventId) }
         override fun load() = saved.values.toList()
         override fun loadReceipts() = emptyList<NotePublicationReceipt>()
         override fun save(publication: NotePublication) { saved[publication.event.id] = publication }
@@ -49,8 +61,8 @@ class PowManagerTest {
         val transport = Transport().apply { accept = true }
         val store = Store()
         val dispatcher = StandardTestDispatcher(testScheduler)
-        val accounts = NotePublicationAccounts { account, wait ->
-            NotePublisher(account, store, transport, backgroundScope, {}, ioDispatcher = dispatcher, beforeRestore = wait)
+        val accounts = Accounts(backgroundScope) { account, scope ->
+            NotePublisher(account, store, transport, scope, {}, ioDispatcher = dispatcher, verifyEvent = { true })
         }
         val manager = PowManager({ 0 }, { accounts.publisher.value }, dispatcher)
         val signer = Signer("a".repeat(64))
@@ -70,8 +82,8 @@ class PowManagerTest {
         val stores = mapOf(a to Store(), b to Store())
         val transport = Transport().apply { accept = true }
         val dispatcher = StandardTestDispatcher(testScheduler)
-        val accounts = NotePublicationAccounts { account, wait ->
-            NotePublisher(account, stores.getValue(account), transport, backgroundScope, {}, ioDispatcher = dispatcher, beforeRestore = wait)
+        val accounts = Accounts(backgroundScope) { account, scope ->
+            NotePublisher(account, stores.getValue(account), transport, scope, {}, ioDispatcher = dispatcher, verifyEvent = { true })
         }
         val manager = PowManager({ 0 }, { accounts.publisher.value }, dispatcher)
         val oldSigner = Signer(a, CompletableDeferred())
@@ -96,8 +108,8 @@ class PowManagerTest {
         val stores = mapOf(a to Store(), b to Store())
         val transport = Transport()
         val dispatcher = StandardTestDispatcher(testScheduler)
-        val accounts = NotePublicationAccounts { account, wait ->
-            NotePublisher(account, stores.getValue(account), transport, backgroundScope, {}, ioDispatcher = dispatcher, beforeRestore = wait)
+        val accounts = Accounts(backgroundScope) { account, scope ->
+            NotePublisher(account, stores.getValue(account), transport, scope, {}, ioDispatcher = dispatcher, verifyEvent = { true })
         }
         val manager = PowManager({ 0 }, { accounts.publisher.value }, dispatcher)
         var completed = false
@@ -116,8 +128,8 @@ class PowManagerTest {
     @Test fun `stale signer cannot submit through the new account`() = runTest {
         val transport = Transport()
         val dispatcher = StandardTestDispatcher(testScheduler)
-        val accounts = NotePublicationAccounts { account, wait ->
-            NotePublisher(account, Store(), transport, backgroundScope, {}, ioDispatcher = dispatcher, beforeRestore = wait)
+        val accounts = Accounts(backgroundScope) { account, scope ->
+            NotePublisher(account, Store(), transport, scope, {}, ioDispatcher = dispatcher, verifyEvent = { true })
         }
         accounts.switchAccount("b".repeat(64))
         val manager = PowManager({ 0 }, { accounts.publisher.value }, dispatcher)
@@ -130,8 +142,8 @@ class PowManagerTest {
         val transport = Transport()
         val store = Store()
         val dispatcher = StandardTestDispatcher(testScheduler)
-        val accounts = NotePublicationAccounts { account, wait ->
-            NotePublisher(account, store, transport, backgroundScope, {}, ioDispatcher = dispatcher, beforeRestore = wait)
+        val accounts = Accounts(backgroundScope) { account, scope ->
+            NotePublisher(account, store, transport, scope, {}, ioDispatcher = dispatcher, verifyEvent = { true })
         }
         val manager = PowManager({ 256 }, { accounts.publisher.value })
         accounts.switchAccount("a".repeat(64))
@@ -156,11 +168,12 @@ class PowManagerTest {
         val release = CompletableDeferred<Unit>()
         val dispatcher = StandardTestDispatcher(testScheduler)
         val publisher = NotePublisher("a".repeat(64), store, transport, backgroundScope, {},
-            ioDispatcher = dispatcher, beforeRestore = { release.await() })
+            ioDispatcher = dispatcher, beforeRestore = { release.await() }, verifyEvent = { true })
         val manager = PowManager({ 0 }, { publisher }, dispatcher)
         assertTrue(manager.submitNote(Signer("a".repeat(64)), "cancelled post", emptyList()))
         runCurrent()
-        assertTrue(manager.status.value is PowStatus.Mining)
+        assertTrue(manager.status.value is PowStatus.Publishing)
+        assertTrue(manager.isBusy)
         assertTrue(transport.sent.isEmpty())
         manager.cancel()
         runCurrent()
@@ -185,7 +198,7 @@ class PowManagerTest {
                 }
             }
         }
-        val publisher = NotePublisher("a".repeat(64), cancellingStore, transport, backgroundScope, {}, ioDispatcher = dispatcher)
+        val publisher = NotePublisher("a".repeat(64), cancellingStore, transport, backgroundScope, {}, ioDispatcher = dispatcher, verifyEvent = { true })
         manager = PowManager({ 0 }, { publisher }, dispatcher)
         manager.submitNote(Signer("a".repeat(64)), "cancel during save", emptyList())
         runCurrent()
@@ -209,7 +222,7 @@ class PowManagerTest {
         lateinit var manager: PowManager
         var cached = 0
         val publisher = NotePublisher("a".repeat(64), store, transport, backgroundScope,
-            { cached++; manager.cancel() }, ioDispatcher = dispatcher)
+            { cached++; manager.cancel() }, ioDispatcher = dispatcher, verifyEvent = { true })
         manager = PowManager({ 0 }, { publisher }, dispatcher)
         manager.submitNote(Signer("a".repeat(64)), "cancel before handoff", emptyList())
         runCurrent()

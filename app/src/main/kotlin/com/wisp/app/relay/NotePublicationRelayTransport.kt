@@ -9,7 +9,7 @@ class NotePublicationRelayTransport(
     private val outboxRouter: OutboxRouter
 ) : NotePublicationTransport {
     override val results = relayPool.publishResults
-    override val relayCopies = relayPool.verifiedRelayEvents.map { it.event to it.relayUrl }
+    override val relayCopies = relayPool.relayEvents.map { it.event to it.relayUrl }
 
     override fun targetRelays(inboxPubkeys: Collection<String>): Set<String> =
         outboxRouter.getPublicationTargets(inboxPubkeys)

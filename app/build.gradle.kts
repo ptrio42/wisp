@@ -19,8 +19,8 @@ android {
         applicationId = baseApplicationId
         minSdk = 26
         targetSdk = 36
-        versionCode = 90
-        versionName = "1.2.5"
+        versionCode = 91
+        versionName = "1.3.0"
         resValue("string", "app_name", "Wisp")
 
         ndk {
@@ -106,6 +106,7 @@ dependencies {
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.robolectric)
     testImplementation(libs.mockito.core)
+    testRuntimeOnly(libs.secp256k1.kmp.jni.jvm)
     testImplementation(libs.compose.ui.test.junit4)
     debugImplementation(libs.compose.ui.test.manifest)
 

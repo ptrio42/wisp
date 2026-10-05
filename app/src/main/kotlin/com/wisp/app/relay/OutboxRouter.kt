@@ -355,10 +355,10 @@ class OutboxRouter(
     /** Resolve all publication targets before sending so even immediate OKs can be tracked. */
     fun getPublicationTargets(targetPubkeys: Collection<String>): Set<String> = buildSet {
         addAll(relayPool.getWriteRelayUrls())
-        for (pubkey in targetPubkeys.toSet()) {
-            addAll(relayListRepo.getReadRelays(pubkey).orEmpty())
+        for (pubkey in targetPubkeys.asSequence().distinct().take(20)) {
+            addAll(relayListRepo.getReadRelays(pubkey).orEmpty().take(2))
         }
-    }
+    }.asSequence().mapNotNull(RelayConfig::publicationUrl).distinct().take(32).toSet()
 
     /**
      * Publish an event to own write relays AND the union of all target users' read (inbox)

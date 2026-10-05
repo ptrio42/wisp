@@ -35,11 +35,17 @@ class FileNotePublicationStore(
         .mapNotNull { name ->
             try {
                 val publication = json.decodeFromString<NotePublication>(files.read(File(directory, name)))
-                if (publication.acceptedCount > 0 || loadReceipts().any { it.eventId == publication.event.id }) {
+                if (publication.event.id != name.removeSuffix(".json")) {
+                    removePayload(name.removeSuffix(".json"))
+                    null
+                } else if (publication.acceptedCount > 0 || loadReceipts().any { it.eventId == publication.event.id }) {
                     // Clean up a payload left behind by interruption between receipt save and deletion.
                     deletePayload(publication.event.id)
                     null
                 } else publication
+            } catch (_: kotlinx.serialization.SerializationException) {
+                removePayload(name.removeSuffix(".json"))
+                null
             } catch (_: Exception) {
                 Log.w("NotePublicationStore", "Could not restore a saved publication")
                 null
@@ -58,8 +64,23 @@ class FileNotePublicationStore(
             receipts = next
             deletePayload(publication.event.id)
         } else {
-            files.write(File(directory, "${publication.event.id}.json"), json.encodeToString(publication))
+            val path = File(directory, "${publication.event.id}.json")
+            if (!path.exists()) checkCapacity()
+            files.write(path, json.encodeToString(publication))
         }
+    }
+
+    override fun checkCapacity() {
+        if (directory.listFiles().orEmpty().map { it.name.removeSuffix(".bak") }.distinct().count {
+            it.matches(Regex("[0-9a-f]{64}\\.json"))
+        } >= RECOVERY_POST_LIMIT) {
+            throw IOException("Recovery storage is full. Rebroadcast or delete pending posts before publishing more.")
+        }
+    }
+
+    override fun removePayload(eventId: String) {
+        require(eventId.matches(Regex("[0-9a-f]{64}"))) { "Invalid event ID" }
+        deletePayload(eventId)
     }
 
     private fun deletePayload(eventId: String) {

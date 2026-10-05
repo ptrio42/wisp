@@ -42,6 +42,8 @@ interface NotePublicationStore {
     fun load(): List<NotePublication>
     fun loadReceipts(): List<NotePublicationReceipt>
     fun save(publication: NotePublication)
+    fun checkCapacity() {}
+    fun removePayload(eventId: String)
 }
 
 /** Bounded delivery history, with no note content, tags or signature. */
@@ -58,3 +60,5 @@ data class NotePublicationReceipt(
 fun NotePublication.receipt(): NotePublicationReceipt = NotePublicationReceipt(event.id, relays, attempt)
 
 const val PUBLICATION_RECEIPT_LIMIT = 100
+
+const val RECOVERY_POST_LIMIT = 100

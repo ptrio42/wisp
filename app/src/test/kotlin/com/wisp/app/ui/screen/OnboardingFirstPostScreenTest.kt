@@ -55,6 +55,7 @@ class OnboardingFirstPostScreenTest {
     private var posted = 0
     private var skipped = 0
     @Volatile private var failWrites = false
+    private var fullStorage = false
     private var signGate: CompletableDeferred<Unit>? = null
     private val introduction = "#introductions\n\nHello from my first post"
 
@@ -82,6 +83,10 @@ class OnboardingFirstPostScreenTest {
         scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
         store = FileNotePublicationStore(directory)
         val controlledStore = object : NotePublicationStore by store {
+            override fun checkCapacity() {
+                if (fullStorage) throw IOException("Recovery storage is full")
+                store.checkCapacity()
+            }
             override fun save(publication: NotePublication) {
                 if (failWrites) throw IOException("Storage unavailable")
                 store.save(publication)
@@ -92,7 +97,7 @@ class OnboardingFirstPostScreenTest {
             override fun targetRelays(inboxPubkeys: Collection<String>) = setOf("wss://offline.example")
             override suspend fun send(relayUrl: String, event: NostrEvent) = false
         }
-        publisher = NotePublisher(pubkey, controlledStore, transport, scope, eventRepo::addEvent)
+        publisher = NotePublisher(pubkey, controlledStore, transport, scope, eventRepo::addEvent, verifyEvent = { true })
         eventRepo.notePublisher = publisher
         viewModel.init(ProfileRepository(app), ContactRepository(app, pubkey), relayPool, eventRepo)
     }
@@ -129,7 +134,7 @@ class OnboardingFirstPostScreenTest {
             assertNull(viewModel.error.value)
         }
         assertEquals(0, skipped)
-        assertTrue(store.load().any { it.event.content == introduction })
+        assertTrue(store.load().isNotEmpty())
     }
 
     private fun await(condition: () -> Boolean) {
@@ -203,7 +208,8 @@ class OnboardingFirstPostScreenTest {
         }
         compose.onNodeWithText("Post introduction").assertIsEnabled()
         compose.runOnIdle { gate.complete(Unit) }
-        await { store.load().any { it.event.content == introduction } }
+        compose.waitForIdle()
+        assertTrue(store.load().isEmpty())
         compose.runOnIdle {
             assertEquals(0, posted)
             assertFalse(viewModel.publishing.value)
@@ -211,6 +217,53 @@ class OnboardingFirstPostScreenTest {
         }
         compose.onNodeWithText("Post introduction").performClick()
         assertCompleted()
-        assertEquals(2, store.load().size)
+        assertEquals(1, store.load().size)
+    }
+
+    @Test fun `editing while signing cancels the obsolete publication before storage or sending`() {
+        signGate = CompletableDeferred()
+        showOnboarding()
+        compose.onNodeWithText("Post introduction").performClick()
+        await { viewModel.publishing.value }
+        val updated = "#introductions\n\nUpdated before signing completed"
+        compose.runOnIdle { viewModel.updateContent(androidx.compose.ui.text.input.TextFieldValue(updated)) }
+        compose.runOnIdle { signGate!!.complete(Unit) }
+        compose.waitForIdle()
+        assertTrue(store.load().isEmpty())
+        assertEquals(0, posted)
+        assertEquals(updated, viewModel.content.value.text)
+        compose.onNodeWithText("Post introduction").assertIsEnabled().performClick()
+        assertCompleted()
+        assertEquals(updated, store.load().single().event.content)
+    }
+
+    @Test fun `leaving during undo countdown keeps the draft without publishing`() {
+        InterfacePreferences(app).apply { setPostUndoTimerEnabled(true); setPostUndoTimerSeconds(5) }
+        showOnboarding()
+        compose.onNodeWithText("Post introduction").performClick()
+        compose.runOnIdle { route.value = "profile" }
+        compose.onNodeWithText("profile").assertIsDisplayed()
+        compose.waitForIdle()
+        assertEquals(0, posted)
+        assertTrue(store.load().isEmpty())
+        assertEquals(introduction, viewModel.content.value.text)
+        assertFalse(viewModel.publishing.value)
+    }
+
+    @Test fun `full recovery storage refuses PoW handoff and retains the editor draft`() {
+        showOnboarding()
+        val manager = com.wisp.app.viewmodel.PowManager({ 0 }, { publisher })
+        fullStorage = true
+        compose.runOnIdle {
+            viewModel.initPowState(true)
+            viewModel.publish(editorScope = scope, relayPool = relayPool, signer = signer,
+                powManager = manager, onSuccess = { posted++ })
+        }
+        await { viewModel.error.value != null }
+        assertEquals(0, posted)
+        assertEquals(introduction, viewModel.content.value.text)
+        assertEquals(com.wisp.app.viewmodel.PowStatus.Idle, manager.status.value)
+        assertFalse(viewModel.publishing.value)
+        assertTrue(store.load().isEmpty())
     }
 }

@@ -7,7 +7,6 @@ import com.wisp.app.nostr.ClientMessage
 import com.wisp.app.repo.DiagnosticLogger
 import com.wisp.app.nostr.NostrEvent
 import com.wisp.app.nostr.RelayMessage
-import com.wisp.app.nostr.RelayMessage.Auth
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -25,14 +24,19 @@ import okhttp3.OkHttpClient
 import java.util.concurrent.CopyOnWriteArrayList
 
 data class RelayEvent(val event: NostrEvent, val relayUrl: String, val subscriptionId: String)
-data class BroadcastState(
-    val accepted: Int,
-    val sent: Int,
-    val finished: Boolean,
-    val rejected: Int
-)
+data class BroadcastState(val accepted: Int, val sent: Int, val finished: Boolean, val rejected: Int)
 
-class RelayPool(private val prefs: SharedPreferences? = null) {
+class RelayPool(private var prefs: SharedPreferences? = null) {
+    /** Point AUTH storage at another account, clearing the old signer/trust first.
+     * Configure pinned/DM/group AUTH targets and the new signer AFTER this call. */
+    fun rekeyAuthPrefs(newPrefs: SharedPreferences?) {
+        synchronized(authLock) {
+            clearAccountAuthState()
+            prefs = newPrefs
+            newPrefs?.getStringSet(PREF_APPROVED_AUTH_RELAYS, emptySet())?.let { userApprovedAuthRelays.addAll(it) }
+        }
+    }
+
     /** Incremented on every reconnectAll()/forceReconnectAll(). Allows SubscriptionManager
      *  to detect stale EOSE signals from pre-reconnect subscriptions. */
     @Volatile var reconnectGeneration: Long = 0
@@ -74,27 +78,22 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
 
     /** Approve a pending AUTH request — signs and sends AUTH, persists approval. */
     fun approveAuth(request: PendingAuthRequest) {
-        userApprovedAuthRelays.add(request.relayUrl)
-        prefs?.edit()?.putStringSet(PREF_APPROVED_AUTH_RELAYS, userApprovedAuthRelays.toSet())?.apply()
-        _pendingAuthRequest.value = null
-        scope.launch {
-            val signer = authSigner ?: return@launch
-            try {
-                val relay = relayIndex[request.relayUrl] ?: return@launch
-                val authEvent = signer(request.relayUrl, request.challenge)
-                relay.send(ClientMessage.auth(authEvent))
-                authenticatedRelays.add(request.relayUrl)
-                Log.d("RelayPool", "AUTH approved and sent to ${request.relayUrl}")
-                _authCompleted.tryEmit(request.relayUrl)
-            } catch (e: Exception) {
-                Log.e("RelayPool", "AUTH failed after approval for ${request.relayUrl}: ${e.message}")
-            }
+        synchronized(authLock) {
+            if (_pendingAuthRequest.value !== request || authSessions[request.relayUrl] !== request) return
+            userApprovedAuthRelays.add(request.relayUrl)
+            prefs?.edit()?.putStringSet(PREF_APPROVED_AUTH_RELAYS, userApprovedAuthRelays.toSet())?.apply()
+            _pendingAuthRequest.value = null
         }
+        scope.launch { sendAuth(request) }
     }
 
     /** Deny a pending AUTH request. */
     fun denyAuth(request: PendingAuthRequest) {
-        _pendingAuthRequest.value = null
+        synchronized(authLock) {
+            if (_pendingAuthRequest.value !== request) return
+            _pendingAuthRequest.value = null
+            authSessions.remove(request.relayUrl)
+        }
         Log.d("RelayPool", "AUTH denied for ${request.relayUrl}")
     }
 
@@ -137,6 +136,8 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
     private val unsupportedCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    // NostrEvent equality includes the complete payload and signature, not just the supplied ID.
+    private val signatureVerifier = BoundedVerification<NostrEvent>(scope, verify = NostrEvent::verifySignature)
     val subscriptionTracker = SubscriptionTracker()
     private val seenEvents = LruCache<String, Boolean>(10000)
     private val seenLock = Any()
@@ -159,16 +160,75 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
         listOf("thread-", "user", "quote-", "editprofile", "notif", "dms", "search-", "hashtag-")
     )
 
-    /** Signing lambda for NIP-42 AUTH — set via [setAuthSigner]. */
+    private val authLock = Any()
+    /** Signing lambda for NIP-42 AUTH, guarded by [authLock]. */
     private var authSigner: (suspend (relayUrl: String, challenge: String) -> NostrEvent)? = null
+    private val authSessions = mutableMapOf<String, PendingAuthRequest>()
     private val authenticatedRelays = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
 
     /**
      * Register a signer for NIP-42 AUTH challenges.
      * The lambda receives the relay URL and challenge string and must return a signed kind-22242 event.
+     * Null disables signing and invalidates in-flight challenges, but keeps account approvals.
      */
-    fun setAuthSigner(signer: suspend (relayUrl: String, challenge: String) -> NostrEvent) {
-        authSigner = signer
+    fun setAuthSigner(signer: (suspend (relayUrl: String, challenge: String) -> NostrEvent)?) {
+        synchronized(authLock) {
+            clearAuthSessions()
+            authSigner = signer
+        }
+    }
+
+    /** Call BEFORE changing accounts or logging out. Disables the old signer and clears
+     * account-specific trust/session state in memory, without deleting persisted approvals.
+     * Then disconnect old sockets, rekeyAuthPrefs, configure targets, and install the new signer. */
+    fun clearAccountAuthState() {
+        synchronized(authLock) {
+            authSigner = null
+            clearAuthSessions()
+            dmDeliveryTargets.clear()
+            groupRelayAuthTargets.clear()
+            userApprovedAuthRelays.clear()
+            pinnedRelayUrls = emptySet()
+        }
+    }
+
+    private fun clearAuthSessions() {
+        synchronized(authLock) {
+            authSessions.clear()
+            authenticatedRelays.clear()
+            _pendingAuthRequest.value = null
+        }
+    }
+
+    private fun clearRelayAuthSession(url: String) {
+        synchronized(authLock) {
+            authSessions.remove(url)
+            authenticatedRelays.remove(url)
+            if (_pendingAuthRequest.value?.relayUrl == url) _pendingAuthRequest.value = null
+        }
+    }
+
+    private suspend fun sendAuth(request: PendingAuthRequest) {
+        val (signer, relay) = synchronized(authLock) {
+            if (authSessions[request.relayUrl] !== request) return
+            (authSigner ?: return) to (relayIndex[request.relayUrl] ?: return)
+        }
+        try {
+            val event = signer(request.relayUrl, request.challenge)
+            synchronized(authLock) {
+                // A suspended external signer may return after account switch or disconnect.
+                if (authSigner !== signer || authSessions[request.relayUrl] !== request ||
+                    relayIndex[request.relayUrl] !== relay || !relay.isConnected) return
+                if (relay.send(ClientMessage.auth(event))) {
+                    authenticatedRelays.add(request.relayUrl)
+                    _authCompleted.tryEmit(request.relayUrl)
+                }
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Log.e("RelayPool", "AUTH failed for ${request.relayUrl}: ${e.message}")
+        }
     }
 
     fun registerDedupBypass(prefix: String) {
@@ -180,14 +240,12 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
 
     private val _relayEvents = MutableSharedFlow<RelayEvent>(extraBufferCapacity = 4096)
     val relayEvents: SharedFlow<RelayEvent> = _relayEvents
-    val eventProvenance = com.wisp.app.repo.RelayEventProvenance()
-    private val _verifiedRelayEvents = MutableSharedFlow<RelayEvent>(extraBufferCapacity = 4096)
-    val verifiedRelayEvents: SharedFlow<RelayEvent> = _verifiedRelayEvents
 
     private val _eoseSignals = MutableSharedFlow<String>(extraBufferCapacity = 64)
     val eoseSignals: SharedFlow<String> = _eoseSignals
 
-    /** Event IDs that failed async signature verification and should be removed from UI. */
+    /** Retraction stream for already-delivered invalid events. Verification now precedes delivery,
+     * so rejected network payloads MUST NOT emit here: a forged ID could retract a valid event. */
     private val _invalidEvents = MutableSharedFlow<String>(extraBufferCapacity = 64)
     val invalidEvents: SharedFlow<String> = _invalidEvents
 
@@ -366,10 +424,12 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
     }
 
     private fun cancelRelayJobs(url: String) {
+        clearRelayAuthSession(url)
         relayJobs.remove(url)?.cancel()
     }
 
     private fun collectMessages(relay: Relay) {
+        clearRelayAuthSession(relay.config.url)
         val parentJob = SupervisorJob()
         relayJobs[relay.config.url]?.cancel()
         relayJobs[relay.config.url] = parentJob
@@ -378,6 +438,12 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
             relay.messages.collect { msg ->
                 when (msg) {
                     is RelayMessage.EventMsg -> {
+                        // Validate independently of delivery dedup, including bypass subscriptions.
+                        // Awaiting admission/results also preserves EVENT-before-EOSE ordering.
+                        if (!signatureVerifier.verify(msg.event)) {
+                            Log.w("RelayPool", "Invalid signature: id=${msg.event.id.take(12)} kind=${msg.event.kind} relay=${relay.config.url}")
+                            return@collect
+                        }
                         // Some subscriptions bypass dedup since events may already
                         // have been seen during feed loading
                         val bypassDedup = dedupBypassPrefixes.any {
@@ -397,21 +463,12 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
                                 }
                             }
                         }
-                        // Verify every relay copy, including duplicates suppressed from the feed.
-                        scope.launch(Dispatchers.Default) {
-                            if (eventProvenance.verifyAndRecord(msg.event, relay.config.url)) {
-                                _verifiedRelayEvents.emit(RelayEvent(msg.event, relay.config.url, msg.subscriptionId))
-                            } else if (shouldEmit) {
-                                // A suppressed invalid duplicate must not retract a cached valid copy.
-                                _invalidEvents.tryEmit(msg.event.id)
-                            }
-                        }
                         if (shouldEmit) {
                             if (msg.event.kind == 1018) {
                                 Log.d("POLL", "[Pool] emit kind 1018 id=${msg.event.id.take(12)} sub=${msg.subscriptionId} relay=${relay.config.url}")
                             }
-                            _events.tryEmit(msg.event)
-                            _relayEvents.tryEmit(RelayEvent(msg.event, relay.config.url, msg.subscriptionId))
+                            _events.emit(msg.event)
+                            _relayEvents.emit(RelayEvent(msg.event, relay.config.url, msg.subscriptionId))
                             subEventCounts.getOrPut(msg.subscriptionId) { java.util.concurrent.atomic.AtomicInteger(0) }.incrementAndGet()
                             if (msg.subscriptionId.startsWith("feed")) {
                                 val count = ++feedEventCounter
@@ -504,6 +561,7 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
         }
         scope.launch(parentJob) {
             relay.connectionState.collect { connected ->
+                if (relayIndex[relay.config.url] !== relay) return@collect
                 Log.d("RLC", "[Pool] connectionState=$connected for ${relay.config.url} | relay.isConnected=${relay.isConnected} appIsActive=$appIsActive isReconnecting=$isReconnecting")
                 updateConnectedCount()
                 if (connected) {
@@ -514,6 +572,7 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
                     if (appIsActive && !isReconnecting) healthTracker?.onRelayConnected(relay.config.url)
                 } else {
                     if (appIsActive && !isReconnecting) healthTracker?.closeSession(relay.config.url)
+                    clearRelayAuthSession(relay.config.url)
                     subscriptionTracker.untrackRelay(relay.config.url)
                 }
             }
@@ -525,50 +584,23 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
     private fun collectAuthChallenges(relay: Relay, parentJob: Job) {
         scope.launch(parentJob) {
             relay.authChallenges.collect { challenge ->
-                val signer = authSigner ?: return@collect
                 val url = relay.config.url
-                val dmRelayUrls = dmRelays.map { it.config.url }.toSet()
-
-                // Tier 1: User's own relays — auto-sign silently (if auth enabled on config)
-                if (url in pinnedRelayUrls || url in dmRelayUrls) {
-                    if (!relay.config.auth) {
-                        Log.d("RelayPool", "AUTH challenge discarded — auth disabled for relay $url")
+                val request = synchronized(authLock) {
+                    if (authSigner == null || relayIndex[url] !== relay || !relay.isConnected) return@collect
+                    clearRelayAuthSession(url)
+                    val trusted = url in pinnedRelayUrls || dmRelays.any { it.config.url == url }
+                    val needsApproval = url in dmDeliveryTargets || url in groupRelayAuthTargets
+                    if (trusted && !relay.config.auth) return@collect
+                    if (!trusted && !needsApproval) return@collect
+                    val request = PendingAuthRequest(url, challenge)
+                    authSessions[url] = request
+                    if (!trusted && url !in userApprovedAuthRelays) {
+                        _pendingAuthRequest.value = request
                         return@collect
                     }
-                    try {
-                        val authEvent = signer(url, challenge)
-                        relay.send(ClientMessage.auth(authEvent))
-                        authenticatedRelays.add(url)
-                        Log.d("RelayPool", "AUTH auto-signed for trusted relay $url")
-                        _authCompleted.tryEmit(url)
-                    } catch (e: Exception) {
-                        Log.e("RelayPool", "AUTH failed for trusted relay $url: ${e.message}")
-                    }
-                    return@collect
+                    request
                 }
-
-                // Tier 2: DM delivery relays and joined NIP-29 chat relays — prompt user
-                // (or auto-sign if they've already granted approval for this URL).
-                if (url in dmDeliveryTargets || url in groupRelayAuthTargets) {
-                    if (url in userApprovedAuthRelays) {
-                        try {
-                            val authEvent = signer(url, challenge)
-                            relay.send(ClientMessage.auth(authEvent))
-                            authenticatedRelays.add(url)
-                            Log.d("RelayPool", "AUTH auto-signed for approved relay $url")
-                            _authCompleted.tryEmit(url)
-                        } catch (e: Exception) {
-                            Log.e("RelayPool", "AUTH failed for approved relay $url: ${e.message}")
-                        }
-                    } else {
-                        Log.d("RelayPool", "AUTH challenge from $url — prompting user")
-                        _pendingAuthRequest.value = PendingAuthRequest(url, challenge)
-                    }
-                    return@collect
-                }
-
-                // Tier 3: Everything else — silently discard
-                Log.d("RelayPool", "AUTH challenge discarded from untrusted relay $url")
+                sendAuth(request)
             }
         }
     }
@@ -607,22 +639,6 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
             }
         }
         return sentCount
-    }
-
-    /** Explicit publication attempt, without leaving an EVENT in the reconnect queue. */
-    suspend fun sendPublicationToRelay(url: String, event: NostrEvent): Boolean {
-        if (url in blockedUrls || !RelayConfig.isValidUrl(url)) return false
-        if (relayIndex[url] == null) {
-            if (healthTracker?.isBad(url) == true) return false
-            if (System.currentTimeMillis() < (relayCooldowns[url] ?: 0L)) return false
-            connectEphemeralRelay(url)
-        }
-        val relay = relayIndex[url] ?: return false
-        relay.resetBackoff()
-        relay.connect()
-        if (!relay.awaitConnected(5000)) return false
-        if (ephemeralRelays.containsKey(url)) ephemeralLastUsed[url] = System.currentTimeMillis()
-        return relay.send(ClientMessage.event(event), queueIfDisconnected = false)
     }
 
     /** Send an EVENT message to all relays (read + write) so every relay gets it. */
@@ -692,7 +708,7 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
         return final
     }
 
-    /** UI summary only. Durable, per-event delivery state lives in NotePublisher. */
+    /** UI summary only. Per-event delivery state lives in NotePublisher. */
     fun setBroadcastState(state: BroadcastState?) {
         _broadcastState.value = state
     }
@@ -853,6 +869,26 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
         ephemeralLastUsed[url] = System.currentTimeMillis()
     }
 
+    /** Explicit publication attempt, without leaving an EVENT in the reconnect queue. */
+    suspend fun sendPublicationToRelay(url: String, event: NostrEvent): Boolean {
+        val target = RelayConfig.publicationUrl(url) ?: return false
+        if (!RelayConfig.isValidUrl(target) || blockedUrls.any { RelayConfig.publicationUrl(it) == target }) return false
+        fun existing() = relayIndex[target] ?: relayIndex.values.firstOrNull {
+            RelayConfig.publicationUrl(it.config.url) == target
+        }
+        if (existing() == null) {
+            if (healthTracker?.isBad(target) == true) return false
+            if (System.currentTimeMillis() < (relayCooldowns[target] ?: 0L)) return false
+            connectEphemeralRelay(target)
+        }
+        val relay = existing() ?: return false
+        relay.resetBackoff()
+        relay.connect()
+        if (!relay.awaitConnected(5000)) return false
+        if (ephemeralRelays.containsKey(relay.config.url)) ephemeralLastUsed[relay.config.url] = System.currentTimeMillis()
+        return relay.send(ClientMessage.event(event), queueIfDisconnected = false)
+    }
+
     fun sendToRelayOrEphemeral(
         url: String,
         message: String,
@@ -965,7 +1001,7 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
                     ephemeralRelays.remove(relay.config.url)
                     ephemeralLastUsed.remove(relay.config.url)
                     relayIndex.remove(relay.config.url)
-                    authenticatedRelays.remove(relay.config.url)
+                    clearRelayAuthSession(relay.config.url)
                     Log.d("RelayPool", "Cooldown ${cooldownMs / 1000}s for ephemeral ${relay.config.url} (http=${failure.httpCode})")
                 } else {
                     Log.d("RelayPool", "Failure on persistent relay ${relay.config.url} (http=${failure.httpCode}), will retry in 3s")
@@ -1016,6 +1052,7 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
     }
 
     fun reconnectAll(): Int {
+        clearAuthSessions()
         Log.d("RLC", "[Pool] reconnectAll() START — persistent=${relays.size} dm=${dmRelays.size} ephemeral=${ephemeralRelays.size} activeSubs=${activeSubscriptions.size}")
         reconnectGeneration++
         isReconnecting = true
@@ -1080,6 +1117,7 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
      * subscriptions have been silently dropped.
      */
     fun forceReconnectAll() {
+        clearAuthSessions()
         Log.d("RLC", "[Pool] forceReconnectAll() START — persistent=${relays.size} dm=${dmRelays.size} ephemeral=${ephemeralRelays.size}")
         reconnectGeneration++
         isReconnecting = true
@@ -1157,12 +1195,15 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
             feedEventDedupCounter = 0
         }
         subscriptionTracker.untrackAll(subscriptionId)
+        subEventCounts.remove(subscriptionId)
+        subStartTimes.remove(subscriptionId)
         for (relayMap in activeSubscriptions.values) {
             relayMap.remove(subscriptionId)
         }
         val msg = ClientMessage.close(subscriptionId)
         for (relay in relays) relay.send(msg)
         for (relay in dmRelays) relay.send(msg)
+        for (relay in groupRelays.values) relay.send(msg)
         for (relay in ephemeralRelays.values) relay.send(msg)
     }
 
@@ -1265,6 +1306,7 @@ class RelayPool(private val prefs: SharedPreferences? = null) {
     }
 
     fun disconnectAll() {
+        clearAuthSessions()
         relays.forEach { it.forceDisconnect() }
         relays.clear()
         dmRelays.forEach { it.forceDisconnect() }

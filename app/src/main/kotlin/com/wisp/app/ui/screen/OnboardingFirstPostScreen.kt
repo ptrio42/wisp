@@ -52,7 +52,7 @@ fun OnboardingFirstPostScreen(
     onPosted: () -> Unit,
     onSkip: () -> Unit
 ) {
-    val editor by com.wisp.app.ui.component.rememberComposeEditor(viewModel)
+    val publicationScope = androidx.compose.runtime.rememberCoroutineScope()
     val content by viewModel.content.collectAsState()
     val publishing by viewModel.publishing.collectAsState()
     val countdown by viewModel.countdownSeconds.collectAsState()
@@ -159,16 +159,15 @@ fun OnboardingFirstPostScreen(
             } else {
                 Button(
                     onClick = {
-                        val owner = editor ?: return@Button
                         viewModel.publish(
-                            editor = owner,
+                            editorScope = publicationScope,
                             relayPool = relayPool,
                             outboxRouter = outboxRouter,
                             signer = signer,
                             onSuccess = onPosted
                         )
                     },
-                    enabled = editor != null && !publishing && content.text.trim().isNotEmpty() && signer != null,
+                    enabled = !publishing && content.text.trim().isNotEmpty() && signer != null,
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp)
                 ) {

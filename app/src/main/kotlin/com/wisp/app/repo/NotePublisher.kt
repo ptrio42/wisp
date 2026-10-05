@@ -2,6 +2,9 @@ package com.wisp.app.repo
 
 import com.wisp.app.nostr.NostrEvent
 import com.wisp.app.relay.PublishResult
+import com.wisp.app.relay.RelayConfig
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -47,7 +50,8 @@ class NotePublisher(
     private val timeoutMs: Long = 10_000,
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     private val verifiedRelayUrls: (NostrEvent) -> Set<String> = { emptySet() },
-    private val beforeRestore: suspend () -> Unit = {}
+    private val beforeRestore: suspend () -> Unit = {},
+    private val verifyEvent: (NostrEvent) -> Boolean = NostrEvent::verifySignature
 ) {
     private val lifecycleLock = Any()
     @Volatile private var closed = false
@@ -85,9 +89,11 @@ class NotePublisher(
     private val ready = accountScope.async(ioDispatcher) {
         beforeRestore()
         currentCoroutineContext().ensureActive()
-        val receipts = store.loadReceipts().takeLast(PUBLICATION_RECEIPT_LIMIT).associateBy { it.eventId }
+        val receipts = store.loadReceipts().takeLast(PUBLICATION_RECEIPT_LIMIT)
+            .map { it.copy(relays = canonicalRelays(it.relays)) }.associateBy { it.eventId }
         val restored = store.load().filter {
-            canPublish(it.event) && it.acceptedCount == 0 && it.event.id !in receipts
+            if (canPublish(it.event) && verifyEvent(it.event) && it.acceptedCount == 0 && it.event.id !in receipts) true
+            else { store.removePayload(it.event.id); false }
         }.map { saved ->
             val recovered = saved.interrupted()
             if (recovered != saved) {
@@ -98,7 +104,7 @@ class NotePublisher(
                     recovered.copy(storageError = true)
                 }
             } else recovered
-        }
+        }.map { it.copy(relays = canonicalRelays(it.relays)) }
         currentCoroutineContext().ensureActive()
         mutex.withLock {
             _receipts.value = receipts
@@ -111,20 +117,34 @@ class NotePublisher(
         // Subscribe before any send, including a relay that replies synchronously.
         accountScope.launch(ioDispatcher, start = CoroutineStart.UNDISPATCHED) {
             transport.results.collect { result ->
-                ready.await()
+                try {
+                    ready.await()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    return@collect
+                }
                 mutex.withLock {
                     val current = _publications.value[result.eventId] ?: return@withLock
-                    val previous = current.relays[result.relayUrl] ?: return@withLock
+                    val relay = RelayConfig.publicationUrl(result.relayUrl) ?: return@withLock
+                    val previous = current.relays[relay] ?: return@withLock
                     // A rejection or duplicate response must not erase confirmed acceptance.
                     if (previous.status == RelayPublicationStatus.ACCEPTED) return@withLock
                     val status = if (result.accepted) RelayPublicationStatus.ACCEPTED else RelayPublicationStatus.REJECTED
-                    update(current.copy(relays = current.relays + (result.relayUrl to RelayPublication(status, result.message))))
+                    update(current.copy(relays = current.relays + (relay to RelayPublication(status, result.message))))
                 }
             }
         }
         accountScope.launch(ioDispatcher, start = CoroutineStart.UNDISPATCHED) {
-            transport.relayCopies.collect { (event, url) ->
-                ready.await()
+            transport.relayCopies.collect { (event, rawUrl) ->
+                val url = RelayConfig.publicationUrl(rawUrl) ?: return@collect
+                try {
+                    ready.await()
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    return@collect
+                }
                 mutex.withLock {
                     val current = _publications.value[event.id] ?: return@withLock
                     // Match the entire signed event; an unverified event with a copied ID is insufficient.
@@ -135,6 +155,7 @@ class NotePublisher(
         }
     }
 
+    /** Cheap eligibility for menus. Preparation verifies the full signature on IO before saving. */
     fun canPublish(event: NostrEvent): Boolean =
         isActive && accountPubkey != null && event.pubkey == accountPubkey && event.sig.isNotBlank() &&
             event.kind in PUBLIC_POST_KINDS && event.created_at <= System.currentTimeMillis() / 1000 + 30 &&
@@ -143,19 +164,33 @@ class NotePublisher(
     fun publicationFor(event: NostrEvent): NotePublication? =
         _publications.value[event.id] ?: _receipts.value[event.id]?.withEvent(event)
 
+    /** Fail before handing the draft to background PoW when recovery storage is full. */
+    suspend fun checkCapacity() = withOperation { scope ->
+        scope.async(ioDispatcher) {
+            ready.await()
+            mutex.withLock { store.checkCapacity() }
+        }.await()
+    }
+
     /** Return once the signed event is durable. Delivery belongs to this account's scope. */
     suspend fun submit(
         event: NostrEvent,
         inboxPubkeys: Collection<String> = event.tags.filter { it.size >= 2 && it[0] == "p" }.map { it[1] }
-    ): NotePublication = prepare(event, inboxPubkeys).await().first
+    ): NotePublication = withOperation { operationScope ->
+        prepare(event, inboxPubkeys, operationScope, accountScope).await().first
+    }
 
     /** Await delivery for status consumers; editor completion should use submit instead. */
     suspend fun publish(
         event: NostrEvent,
         inboxPubkeys: Collection<String> = event.tags.filter { it.size >= 2 && it[0] == "p" }.map { it[1] }
-    ): NotePublication {
-        // One operation owns both preparation and delivery. Account shutdown and caller
-        // cancellation both stop it, even while restoration, the mutex or storage is pending.
+    ): NotePublication = withOperation { operationScope ->
+        val prepared = prepare(event, inboxPubkeys, operationScope).await()
+        if (prepared.third) prepared.first else prepared.second.await()
+    }
+
+    /** Account shutdown joins caller-owned preparation, including a blocking atomic write. */
+    private suspend fun <T> withOperation(block: suspend (CoroutineScope) -> T): T {
         val operation = SupervisorJob(currentCoroutineContext()[Job])
         synchronized(lifecycleLock) {
             if (closed) operation.cancel() else operations.add(operation)
@@ -172,9 +207,7 @@ class NotePublisher(
         }
         val operationScope = CoroutineScope(accountScope.coroutineContext + operation)
         try {
-            val prepared = prepare(event, inboxPubkeys, operationScope).await()
-            if (prepared.third) return prepared.first
-            return prepared.second.await()
+            return block(operationScope)
         } finally {
             operation.cancel()
             withContext(NonCancellable) { operation.join() }
@@ -184,17 +217,20 @@ class NotePublisher(
     private fun prepare(
         event: NostrEvent,
         inboxPubkeys: Collection<String>,
-        operationScope: CoroutineScope = accountScope
+        operationScope: CoroutineScope,
+        deliveryScope: CoroutineScope = operationScope
     ) = operationScope.async(ioDispatcher) {
         ready.await()
         require(canPublish(event)) { "Only the active account's public posts can be rebroadcast" }
-        val targets = transport.targetRelays(inboxPubkeys)
+        require(verifyEvent(event)) { "The event ID and signature must be valid before publication" }
+        val targets = transport.targetRelays(inboxPubkeys).asSequence().mapNotNull(RelayConfig::publicationUrl)
+            .distinct().take(32).toSet()
         mutex.withLock {
             currentCoroutineContext().ensureActive()
             val previous = _publications.value[event.id]
             if (event.id in active) return@withLock Triple(requireNotNull(previous), deliveries.getValue(event.id), true)
             require(previous == null || previous.event == event) { "Rebroadcast must preserve the signed event" }
-            val verified = verifiedRelayUrls(event).associateWith { RelayPublication(RelayPublicationStatus.ACCEPTED) }
+            val verified = verifiedRelayUrls(event).mapNotNull(RelayConfig::publicationUrl).associateWith { RelayPublication(RelayPublicationStatus.ACCEPTED) }
             val accepted = (_receipts.value[event.id]?.relays.orEmpty() + previous?.relays.orEmpty())
                 .filterValues { it.status == RelayPublicationStatus.ACCEPTED } + verified
             val pending = targets.associateWith { accepted[it] ?: RelayPublication(RelayPublicationStatus.PENDING) }
@@ -213,7 +249,7 @@ class NotePublisher(
                 cached = true
                 currentCoroutineContext().ensureActive()
                 active.add(event.id)
-                val delivery = operationScope.async(ioDispatcher, start = CoroutineStart.UNDISPATCHED) { deliver(next, targets) }
+                val delivery = deliveryScope.async(ioDispatcher, start = CoroutineStart.UNDISPATCHED) { deliver(next, targets) }
                 deliveries[event.id] = delivery
                 // UNDISPATCHED enters delivery's finally even if cancellation races handoff.
                 Triple(next, delivery, false)
@@ -232,38 +268,59 @@ class NotePublisher(
         try {
             withTimeoutOrNull(timeoutMs) {
                 coroutineScope {
+                    val sending = Semaphore(4)
                     for (url in targets) launch {
-                        currentCoroutineContext().ensureActive()
-                        val sent = try {
-                            transport.send(url, event)
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (_: Exception) {
-                            false
-                        }
-                        if (!sent) mutex.withLock {
-                            val current = _publications.value.getValue(event.id)
-                            if (current.relays[url]?.status == RelayPublicationStatus.PENDING) {
-                                update(current.copy(relays = current.relays + (url to RelayPublication(RelayPublicationStatus.UNREACHABLE))))
+                        sending.withPermit {
+                            currentCoroutineContext().ensureActive()
+                            if (isDeleted(event)) return@withPermit
+                            val sent = try {
+                                transport.send(url, event)
+                            } catch (e: CancellationException) {
+                                throw e
+                            } catch (_: Exception) {
+                                false
+                            }
+                            if (!sent) mutex.withLock {
+                                val current = _publications.value[event.id] ?: return@withLock
+                                if (current.relays[url]?.status == RelayPublicationStatus.PENDING) {
+                                    update(current.copy(relays = current.relays + (url to RelayPublication(RelayPublicationStatus.UNREACHABLE))))
+                                }
                             }
                         }
                     }
                 }
                 publications.first { notes ->
-                    notes.getValue(event.id).relays.values.none { it.status == RelayPublicationStatus.PENDING }
+                    notes[event.id]?.relays.orEmpty().values.none { it.status == RelayPublicationStatus.PENDING }
                 }
             }
         } finally {
             withContext(NonCancellable) {
                 mutex.withLock {
-                    val current = _publications.value.getValue(event.id)
-                    if (current.attempt == publication.attempt) update(current.interrupted())
+                    val current = _publications.value[event.id]
+                    if (current?.attempt == publication.attempt) update(current.interrupted())
                     active.remove(event.id)
                     deliveries.remove(event.id)
                 }
             }
         }
-        return _publications.value.getValue(event.id)
+        return _publications.value[event.id] ?: publication.interrupted()
+    }
+
+    /** A deletion removes its recovery copy and cancels an unfinished delivery. */
+    fun forget(eventId: String) {
+        accountScope.launch(ioDispatcher) {
+            try {
+                ready.await()
+                mutex.withLock {
+                    deliveries[eventId]?.cancel()
+                    store.removePayload(eventId)
+                    _publications.value = _publications.value - eventId
+                    _actionErrors.value = _actionErrors.value - eventId
+                    if (_latest.value?.event?.id == eventId) _latest.value = null
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) { _actionErrors.value = _actionErrors.value + eventId }
+        }
     }
 
     fun rebroadcast(event: NostrEvent) {
@@ -305,6 +362,13 @@ class NotePublisher(
         // Bound confirmed in-memory records too, while retaining every unresolved or active post.
         _publications.value = (_publications.value + (publication.event.id to publication)).filter { (id, saved) ->
             saved.acceptedCount == 0 || saved.inFlight || id in _receipts.value || saved.storageError
+        }
+    }
+
+    private fun canonicalRelays(relays: Map<String, RelayPublication>): Map<String, RelayPublication> = buildMap {
+        for ((rawUrl, result) in relays) {
+            val url = RelayConfig.publicationUrl(rawUrl) ?: continue
+            if (get(url)?.status != RelayPublicationStatus.ACCEPTED) put(url, result)
         }
     }
 

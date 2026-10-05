@@ -168,7 +168,7 @@ fun ComposeScreen(
     powPrefs: PowPreferences? = null,
     resolvedEmojis: Map<String, String> = emptyMap()
 ) {
-    val editor by com.wisp.app.ui.component.rememberComposeEditor(viewModel)
+    val publicationScope = androidx.compose.runtime.rememberCoroutineScope()
     val content by viewModel.content.collectAsState()
     val publishing by viewModel.publishing.collectAsState()
     val error by viewModel.error.collectAsState()
@@ -199,7 +199,7 @@ fun ComposeScreen(
         viewModel.configureForReply(replyTo)
     }
     val powStatus = powManager?.status?.collectAsState()?.value ?: PowStatus.Idle
-    val isMiningBusy = powStatus is PowStatus.Mining
+    val isMiningBusy = powStatus is PowStatus.Mining || powStatus is PowStatus.Publishing
     val context = LocalContext.current
 
     var showDatePicker by remember { mutableStateOf(false) }
@@ -1290,9 +1290,8 @@ fun ComposeScreen(
                 } else {
                     Button(
                         onClick = {
-                            val owner = editor ?: return@Button
                             viewModel.publish(
-                                editor = owner,
+                                editorScope = publicationScope,
                                 relayPool = relayPool,
                                 replyTo = replyTo,
                                 quoteTo = quoteTo,
@@ -1305,7 +1304,7 @@ fun ComposeScreen(
                                 resolvedEmojis = resolvedEmojis
                             )
                         },
-                        enabled = editor != null && !publishing && !isMiningBusy,
+                        enabled = !publishing && !isMiningBusy,
                         modifier = Modifier.fillMaxWidth().height(44.dp),
                         contentPadding = PaddingValues(0.dp)
                     ) {
